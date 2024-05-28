@@ -27,18 +27,21 @@
 
 package com.onesignal;
 
-import android.content.ComponentName;
-import android.content.Context;
-import android.content.pm.PackageManager;
 import android.util.Base64;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.WorkerThread;
 
+import com.google.android.gms.tasks.Task;
+import com.google.android.gms.tasks.Tasks;
 import com.google.firebase.FirebaseApp;
 import com.google.firebase.FirebaseOptions;
-import com.google.firebase.iid.FirebaseInstanceId;
-import com.google.firebase.iid.FirebaseInstanceIdService;
 import com.google.firebase.messaging.FirebaseMessaging;
+
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.concurrent.ExecutionException;
 
 // TODO: 4.0.0 - Switch to using <action android:name="com.google.firebase.INSTANCE_ID_EVENT"/>
 // Note: Starting with Firebase Messaging 17.1.0 onNewToken in FirebaseMessagingService should be
@@ -57,42 +60,68 @@ class PushRegistratorFCM extends PushRegistratorAbstractGoogle {
 
    private FirebaseApp firebaseApp;
 
-   // Disable in the case where there isn't a default Firebase app as this will crash the app.
-   //   The crash will happen where the Google Play services app fires an intent that the token
-   //      needs to be refreshed.
-   // This checks for gcm_defaultSenderId in values.xml (normally added from google-services.json)
-   // https://github.com/OneSignal/OneSignal-Android-SDK/issues/552
-   // TODO: FirebaseInstanceIdService was removed in firebase-messaging:18.0.0
-   //   Can remove this method once this is our minimum version
-   static void disableFirebaseInstanceIdService(Context context) {
-      String senderId = OSUtils.getResourceString(context, "gcm_defaultSenderId", null);
-      int componentState =
-         senderId == null ?
-         PackageManager.COMPONENT_ENABLED_STATE_DISABLED :
-         PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
-
-      PackageManager pm = context.getPackageManager();
-      try {
-         ComponentName componentName = new ComponentName(context, FirebaseInstanceIdService.class);
-         pm.setComponentEnabledSetting(componentName, componentState, PackageManager.DONT_KILL_APP);
-      } catch (NoClassDefFoundError ignored) {
-         // Will throw if missing FirebaseInstanceIdService class, ignore in this case.
-         // We already print a logcat error in another spot
-      } catch (IllegalArgumentException ignored) {
-         // also not handled
-      }
-   }
-
    @Override
    String getProviderName() {
       return "FCM";
    }
 
+   @WorkerThread
    @Override
-   String getToken(String senderId) throws Throwable {
+   String getToken(String senderId) throws Exception {
       initFirebaseApp(senderId);
-      FirebaseInstanceId instanceId = FirebaseInstanceId.getInstance(firebaseApp);
-      return instanceId.getToken(senderId, FirebaseMessaging.INSTANCE_ID_SCOPE);
+
+      try {
+         return getTokenWithClassFirebaseMessaging();
+      } catch (NoClassDefFoundError | NoSuchMethodError e) {
+         // Class or method wil be missing at runtime if firebase-message older than 21.0.0 is used.
+         OneSignal.Log(
+                 OneSignal.LOG_LEVEL.INFO,
+                 "FirebaseMessaging.getToken not found, attempting to use FirebaseInstanceId.getToken"
+         );
+      }
+
+      // Fallback for firebase-message versions older than 21.0.0
+      return getTokenWithClassFirebaseInstanceId(senderId);
+   }
+
+   // This method is only used if firebase-message older than 21.0.0 is in the app
+   // We are using reflection here so we can compile with firebase-message:22.0.0 and newer
+   //   - This version of Firebase has completely removed FirebaseInstanceId
+   @Deprecated
+   @WorkerThread
+   private String getTokenWithClassFirebaseInstanceId(String senderId) throws IOException {
+      // The following code is equivalent to:
+      //   FirebaseInstanceId instanceId = FirebaseInstanceId.getInstance(firebaseApp);
+      //   return instanceId.getToken(senderId, FirebaseMessaging.INSTANCE_ID_SCOPE);
+      Exception exception;
+      try {
+         Class<?> FirebaseInstanceIdClass = Class.forName("com.google.firebase.iid.FirebaseInstanceId");
+         Method getInstanceMethod = FirebaseInstanceIdClass.getMethod("getInstance", FirebaseApp.class);
+         Object instanceId = getInstanceMethod.invoke(null, firebaseApp);
+         Method getTokenMethod = instanceId.getClass().getMethod("getToken", String.class, String.class);
+         Object token = getTokenMethod.invoke(instanceId, senderId, "FCM");
+         return (String) token;
+      } catch (ClassNotFoundException | NoSuchMethodException | IllegalAccessException |
+               InvocationTargetException e) {
+         exception = e;
+      }
+
+      throw new Error("Reflection error on FirebaseInstanceId.getInstance(firebaseApp).getToken(senderId, FirebaseMessaging.INSTANCE_ID_SCOPE)", exception);
+   }
+
+   @WorkerThread
+   private String getTokenWithClassFirebaseMessaging() throws Exception {
+      // We use firebaseApp.get(FirebaseMessaging.class) instead of FirebaseMessaging.getInstance()
+      //   as the latter uses the default Firebase app. We need to use a custom Firebase app as
+      //   the senderId is provided at runtime.
+      FirebaseMessaging fcmInstance = firebaseApp.get(FirebaseMessaging.class);
+      // FirebaseMessaging.getToken API was introduced in firebase-messaging:21.0.0
+      Task<String> tokenTask = fcmInstance.getToken();
+      try {
+         return Tasks.await(tokenTask);
+      } catch (ExecutionException e) {
+         throw tokenTask.getException();
+      }
    }
 
    private void initFirebaseApp(String senderId) {
